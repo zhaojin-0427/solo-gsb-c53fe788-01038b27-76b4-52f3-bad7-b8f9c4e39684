@@ -21,7 +21,9 @@ T0 = datetime(2025, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
 
 
 def node(sid, s, e, start_open=False, end_open=False, truncated=False):
-    return _Node(sid, float(s), float(e), start_open, end_open, truncated)
+    # Test values are seconds; the planner's grid is whole microseconds.
+    return _Node(sid, round(float(s) * 1e6), round(float(e) * 1e6),
+                 start_open, end_open, truncated)
 
 
 def chain_ids(chain):
@@ -50,14 +52,14 @@ def test_components_join_on_endpoint_touch_same_station():
     clustered = _cluster_station_windows(nodes)
     comps = _build_components(clustered)
     assert len(comps) == 1
-    assert comps[0][0].s == 0.0 and comps[0][0].e == 20.0
+    assert comps[0][0].s == 0 and comps[0][0].e == 20_000_000  # us
 
 
 def test_clustered_same_station_span_needs_no_switch():
     nodes = _cluster_station_windows([node("A", 0, 10), node("A", 10, 25)])
     chain = _best_chain(_build_components(nodes)[0])
     assert chain_ids(chain) == ["A"]
-    assert chain[0].s == 0.0 and chain[0].e == 25.0
+    assert chain[0].s == 0 and chain[0].e == 25_000_000  # us
 
 
 def test_components_bridge_merges_several_components():
@@ -162,7 +164,7 @@ US = 1.0e-6  # one reporting microsecond, in seconds
 
 def test_same_station_abut_exactly_joins_but_one_us_gap_splits():
     joined = _cluster_station_windows([node("A", 0, 10), node("A", 10, 20)])
-    assert len(joined) == 1 and joined[0].e == 20.0
+    assert len(joined) == 1 and joined[0].e == 20_000_000  # us
     # a 1 us gap is a real gap: no join, two separate components
     apart = _cluster_station_windows([node("A", 0, 10), node("A", 10 + US, 20)])
     assert len(apart) == 2
@@ -438,3 +440,40 @@ def test_exactly_equal_durations_fall_back_to_switch_count(monkeypatch):
         "C": ([(0.0, 20.0)], []),
     })
     assert [g.station_id for g in res.plan.segments] == ["C"]
+
+
+def test_equal_length_components_prefer_earlier_start(monkeypatch):
+    # Two disconnected proven windows of exactly 100000 us each, at
+    # different offsets (different stations: the shared endpoint 0.3 does
+    # not connect them). As float seconds their durations subtract to
+    # 0.09999999999999998 and 0.10000000000000003, wrongly crowning the
+    # later window; as integer microsecond differences they are equal, so
+    # the earlier start wins.
+    res = _relay_with(monkeypatch, {
+        "A": ([(0.2, 0.3)], []),
+        "B": ([(0.3, 0.4)], []),
+    }, span_s=1.0)
+    assert [g.station_id for g in res.plan.segments] == ["A"]
+    assert res.plan.start == T0 + timedelta(microseconds=200000)
+    assert res.plan.end == T0 + timedelta(microseconds=300000)
+    assert res.plan.duration_s == 0.1
+
+
+def test_one_us_longer_wins_at_any_offset(monkeypatch):
+    # Same pair, but B's window is 1 us longer: the duration decides
+    # first, wherever the windows sit on the timeline.
+    res = _relay_with(monkeypatch, {
+        "A": ([(0.2, 0.3)], []),
+        "B": ([(0.3, 0.4 + US)], []),
+    }, span_s=1.0)
+    assert [g.station_id for g in res.plan.segments] == ["B"]
+    assert res.plan.duration_s == 0.1 + US
+
+
+def test_equal_length_components_station_id_last_resort(monkeypatch):
+    # Same start, same length, same switch count: the station ID decides.
+    res = _relay_with(monkeypatch, {
+        "Z": ([(0.2, 0.3)], []),
+        "A": ([(0.2, 0.3)], []),
+    }, span_s=1.0)
+    assert [g.station_id for g in res.plan.segments] == ["A"]
