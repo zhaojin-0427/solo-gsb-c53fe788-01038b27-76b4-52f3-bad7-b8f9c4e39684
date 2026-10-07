@@ -158,6 +158,11 @@ def _nan_none(x: float):
     return None if x is None or (isinstance(x, float) and math.isnan(x)) else x
 
 
+def _delta_micros(delta) -> int:
+    """Whole microseconds in a timedelta (microsecond-exact duration sums)."""
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
 @app.post("/relay-plan", response_model=RelayResponse)
 def relay_plan(req: RelayRequest):
     orbit = TwoBodyOrbit(
@@ -208,7 +213,9 @@ def relay_plan(req: RelayRequest):
     )
 
     span_s = (req.end - req.start).total_seconds()
-    unknown_s = sum((u.end - u.start).total_seconds() for u in result.unknown)
+    # Sum on the integer microsecond grid (summing float seconds can pick
+    # up last-bit noise); the single division is the output boundary.
+    unknown_s = sum(_delta_micros(u.end - u.start) for u in result.unknown) / 1e6
     relay_s = result.plan.duration_s if result.plan else 0.0
 
     return RelayResponse(
@@ -226,7 +233,7 @@ def relay_plan(req: RelayRequest):
                         "station_id": seg.station_id,
                         "start": seg.start,
                         "end": seg.end,
-                        "duration_s": (seg.end - seg.start).total_seconds(),
+                        "duration_s": seg.duration_s,
                     }
                     for seg in result.plan.segments
                 ],

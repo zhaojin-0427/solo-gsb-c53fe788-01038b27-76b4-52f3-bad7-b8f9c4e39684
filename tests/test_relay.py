@@ -18,10 +18,14 @@ from app.relay import (
 )
 
 T0 = datetime(2025, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
+_US = 1_000_000  # microseconds per second
 
 
 def node(sid, s, e, start_open=False, end_open=False, truncated=False):
-    return _Node(sid, float(s), float(e), start_open, end_open, truncated)
+    # Planner coordinates are *integer* microseconds after search start;
+    # accept seconds in test data and quantize once at the boundary.
+    return _Node(sid, int(round(s * _US)), int(round(e * _US)),
+                 start_open, end_open, truncated)
 
 
 def chain_ids(chain):
@@ -50,14 +54,14 @@ def test_components_join_on_endpoint_touch_same_station():
     clustered = _cluster_station_windows(nodes)
     comps = _build_components(clustered)
     assert len(comps) == 1
-    assert comps[0][0].s == 0.0 and comps[0][0].e == 20.0
+    assert comps[0][0].s == 0 and comps[0][0].e == 20 * _US
 
 
 def test_clustered_same_station_span_needs_no_switch():
     nodes = _cluster_station_windows([node("A", 0, 10), node("A", 10, 25)])
     chain = _best_chain(_build_components(nodes)[0])
     assert chain_ids(chain) == ["A"]
-    assert chain[0].s == 0.0 and chain[0].e == 25.0
+    assert chain[0].s == 0 and chain[0].e == 25 * _US
 
 
 def test_components_bridge_merges_several_components():
@@ -162,7 +166,7 @@ US = 1.0e-6  # one reporting microsecond, in seconds
 
 def test_same_station_abut_exactly_joins_but_one_us_gap_splits():
     joined = _cluster_station_windows([node("A", 0, 10), node("A", 10, 20)])
-    assert len(joined) == 1 and joined[0].e == 20.0
+    assert len(joined) == 1 and joined[0].e == 20 * _US
     # a 1 us gap is a real gap: no join, two separate components
     apart = _cluster_station_windows([node("A", 0, 10), node("A", 10 + US, 20)])
     assert len(apart) == 2
@@ -438,3 +442,66 @@ def test_exactly_equal_durations_fall_back_to_switch_count(monkeypatch):
         "C": ([(0.0, 20.0)], []),
     })
     assert [g.station_id for g in res.plan.segments] == ["C"]
+
+
+# ------------------------ float-offset equal-duration mis-selection bug ----
+def test_equal_length_windows_at_awkward_float_offsets_pick_earlier(monkeypatch):
+    # Two disjoint proven windows: [0.2, 0.3) s and [0.3, 0.4) s. Both are
+    # exactly 100000 us long, but float subtraction gives
+    # 0.09999999999999998 vs 0.10000000000000003 -- with float seconds the
+    # later plan used to "win". Integer-microsecond durations are equal, so
+    # the earlier start decides.
+    res = _relay_with(monkeypatch, {
+        "A": ([(0.2, 0.3)], []),
+        "B": ([(0.3, 0.4)], []),
+    })
+    assert res.plan is not None
+    assert res.plan.start == T0 + timedelta(microseconds=200_000)
+    assert res.plan.end == T0 + timedelta(microseconds=300_000)
+    assert [g.station_id for g in res.plan.segments] == ["A"]
+    # the external value is the single us/1e6 conversion of 100000 us
+    assert res.plan.duration_s == 100_000 / 1_000_000
+
+
+def test_awkward_offsets_one_us_longer_plan_still_wins(monkeypatch):
+    # Same 0.2/0.3 s region, but the later window is genuinely 1 us longer
+    # (0.3 .. 0.400001 s): duration decides before the earlier-start rule.
+    res = _relay_with(monkeypatch, {
+        "A": ([(0.2, 0.3)], []),
+        "B": ([(0.3, 0.4 + US)], []),
+    })
+    assert res.plan is not None
+    assert res.plan.start == T0 + timedelta(microseconds=300_000)
+    assert res.plan.duration_s == 100_001 / 1_000_000
+    assert [g.station_id for g in res.plan.segments] == ["B"]
+
+
+def test_equal_duration_separate_components_fewer_switches_wins(monkeypatch):
+    # Two disjoint components of exactly equal length (500000 us each, in
+    # the awkward 0.2..0.7 s region): same switch count would fall through
+    # to the earlier start, but here the later component needs fewer
+    # switches and must therefore win.
+    res = _relay_with(monkeypatch, {
+        # earlier component: two stations, one switch
+        "A": ([(0.2, 0.6)], []),
+        "B": ([(0.5, 0.7)], []),
+        # later component: one station, zero switches
+        "C": ([(1.3, 1.8)], []),
+    })
+    assert [g.station_id for g in res.plan.segments] == ["C"]
+    assert len(res.plan.switches) == 0
+    assert res.plan.start == T0 + timedelta(microseconds=1_300_000)
+
+
+def test_duration_s_values_are_single_us_division(monkeypatch):
+    res = _relay_with(monkeypatch, {
+        "A": ([(0.2, 0.5)], []),
+        "B": ([(0.4, 0.7)], []),
+    })
+    plan = res.plan
+    assert plan.duration_s == 500_000 / 1_000_000
+    # segment duration_s values partition the plan exactly
+    assert sum(s.duration_s for s in plan.segments) == plan.duration_s
+    assert all(s.duration_s == (s.end - s.start).total_seconds()
+               for s in plan.segments)
+
